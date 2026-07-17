@@ -13,11 +13,21 @@ TG_TOKEN = '8067819715:AAGDbuuq1Tyo7Ar8RiUsBfrRm4lyr0UnbZc'
 APARAT_USERNAME = os.environ.get('APARAT_USERNAME')
 APARAT_PASSWORD = os.environ.get('APARAT_PASSWORD')
 
+# ساخت یک Session برای مدیریت کوکی‌های کلادفلر
+session = requests.Session()
+
+# هدرهای فوق‌پیشرفته برای شبیه‌سازی دقیق مرورگر کروم
 HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
     'Accept': 'application/json, text/plain, */*',
-    'Accept-Language': 'fa-IR,fa;q=0.9',
-    'Connection': 'keep-alive'
+    'Accept-Language': 'fa-IR,fa;q=0.9,en-US;q=0.8,en;q=0.7',
+    'Accept-Encoding': 'gzip, deflate, br',
+    'Connection': 'keep-alive',
+    'Referer': 'https://www.aparat.com/',
+    'Origin': 'https://www.aparat.com',
+    'X-Requested-With': 'XMLHttpRequest',
+    'Cache-Control': 'no-cache',
+    'Pragma': 'no-cache'
 }
 # ============================================
 
@@ -37,23 +47,26 @@ def upload_to_aparat(video_path: str, title: str, description: str = "آپلود
     try:
         print(f"📤 شروع فرآیند آپلود: {title}")
         
-        # بررسی حیاتی متغیرهای محیطی
-        if not APARAT_USERNAME or not APARAT_PASSWORD or APARAT_USERNAME == 'your_aparat_username':
-            print("❌ خطای بحرانی: متغیرهای محیطی آپارات تنظیم نشده‌اند!")
-            return None, "خطای پیکربندی: نام کاربری یا رمز عبور در سرور تنظیم نشده است."
+        if not APARAT_USERNAME or not APARAT_PASSWORD:
+            return None, "خطای پیکربندی: نام کاربری یا رمز عبور تنظیم نشده است."
 
-        # ۱. لاگین
+        # ۱. لاگین با استفاده از Session
         hashed_pass = _hash_password(APARAT_PASSWORD)
         login_url = f"https://www.aparat.com/etc/api/login/luser/{APARAT_USERNAME}/lpass/{hashed_pass}"
-        print(f"🔐 درخواست لاگین. کاربر: {APARAT_USERNAME}")
+        print(f"🔐 درخواست لاگین (با Session)...")
         
-        res_login = requests.get(login_url, headers=HEADERS, timeout=30)
-        print(f"📥 لاگین -> Status: {res_login.status_code} | Headers: {dict(res_login.headers)}")
-        print(f"📥 لاگین -> Raw Text: '{res_login.text.strip()}'")
+        # استفاده از session.get به جای requests.get
+        res_login = session.get(login_url, headers=HEADERS, timeout=30)
+        print(f"📥 لاگین -> Status: {res_login.status_code}")
+        print(f"📥 لاگین -> Raw Text Length: {len(res_login.text)} chars")
         
         if res_login.status_code != 200:
             return None, f"خطای HTTP {res_login.status_code} در لاگین."
             
+        # اگر متن خالی بود، یعنی کلادفلر بلاک کرده است
+        if not res_login.text.strip():
+            return None, "سرور آپارات پاسخ خالی داد. (احتمالاً آی‌پی سرور Render توسط فایروال آپارات مسدود شده است)."
+
         try:
             data_login = res_login.json()
         except json.JSONDecodeError:
@@ -63,10 +76,11 @@ def upload_to_aparat(video_path: str, title: str, description: str = "آپلود
             return None, f"پاسخ نامعتبر از لاگین: {data_login}"
             
         ltoken = data_login['login']['ltoken']
+        print(f"✅ توکن دریافت شد.")
 
-        # ۲. دریافت فرم
+        # ۲. دریافت فرم (همچنان با Session)
         form_url = f"https://www.aparat.com/etc/api/uploadform/luser/{APARAT_USERNAME}/ltoken/{ltoken}"
-        res_form = requests.get(form_url, headers=HEADERS, timeout=30)
+        res_form = session.get(form_url, headers=HEADERS, timeout=30)
         
         try:
             data_form = res_form.json()
@@ -75,7 +89,8 @@ def upload_to_aparat(video_path: str, title: str, description: str = "آپلود
         except Exception as e:
             return None, f"خطا در دریافت فرم: {str(e)} | پاسخ: {res_form.text[:200]}"
 
-        # ۳. آپلود
+        # ۳. آپلود فایل
+        print(f"⬆️ شروع آپلود تکه‌تکه...")
         file_handle = open(video_path, 'rb')
         files = {'video': (os.path.basename(video_path), file_handle, 'video/mp4')}
         data = {
@@ -87,7 +102,7 @@ def upload_to_aparat(video_path: str, title: str, description: str = "آپلود
             'data[video_pass]': 'false'
         }
         
-        upload_res = requests.post(form_action, files=files, data=data, headers=HEADERS, timeout=1800)
+        upload_res = session.post(form_action, files=files, data=data, headers=HEADERS, timeout=1800)
         
         try:
             data_upload = upload_res.json()
@@ -121,20 +136,17 @@ def webhook():
         try:
             print(f"⬇️ شروع دانلود از: {text}")
             with requests.get(text, stream=True, timeout=120, allow_redirects=True) as r:
-                print(f"📥 وضعیت دانلود: {r.status_code}")
-                print(f"📥 هدرهای دانلود: {dict(r.headers)}")
                 r.raise_for_status()
-                
                 with open(filename, 'wb') as f:
                     for chunk in r.iter_content(chunk_size=8192):
                         if chunk:
                             f.write(chunk)
             
             file_size = os.path.getsize(filename)
-            print(f"✅ حجم فایل ذخیره شده روی دیسک: {file_size} بایت ({file_size / 1024 / 1024:.2f} MB)")
+            print(f"✅ حجم فایل ذخیره شده: {file_size / 1024 / 1024:.2f} MB")
             
             if file_size == 0:
-                send_tg_message(chat_id, "❌ خطا: فایل دانلود شده کاملاً خالی (0 بایت) است.\n\n💡 دلیل: این لینک منقضی شده، یا سرور مبدأ دانلود توسط ربات‌ها را مسدود کرده است. لطفاً یک لینک دیگر تست کنید.")
+                send_tg_message(chat_id, "❌ خطا: فایل دانلود شده خالی است. لینک منقضی یا مسدود شده است.")
                 return jsonify({"ok": True})
             
             send_tg_message(chat_id, f"⬆️ دانلود موفق ({file_size / 1024 / 1024:.1f} MB). در حال آپلود در آپارات...")
@@ -147,7 +159,7 @@ def webhook():
                 send_tg_message(chat_id, f"❌ خطا در آپلود:\n{error}")
                 
         except requests.exceptions.HTTPError as e:
-            send_tg_message(chat_id, f"❌ خطای شبکه در دانلود: سرور مبدأ دسترسی را رد کرد (HTTP {e.response.status_code}).")
+            send_tg_message(chat_id, f"❌ خطای شبکه: سرور مبدأ دسترسی را رد کرد (HTTP {e.response.status_code}).")
         except Exception as e:
             send_tg_message(chat_id, f"❌ خطا: {str(e)[:200]}")
         finally:
