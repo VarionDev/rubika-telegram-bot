@@ -10,11 +10,17 @@ app = Flask(__name__)
 TG_TOKEN = '8067819715:AAGDbuuq1Tyo7Ar8RiUsBfrRm4lyr0UnbZc'
 RUBIKA_TOKEN = 'BAIEEA0ZEUKDUUKNLZQPYCWNPMZEDMIFZLLIHEANSFYNIGCXPBFBTHMFTIWEXKXV'
 TARGET_CHAT_ID = 'b0B2cLU04Ii0a60aed438e58d49b5bb5'
+
+# لیست update_id های پردازش شده (برای جلوگیری از تکرار)
+processed_updates = set()
 # =================================================
 
 def send_tg_message(chat_id, text):
     url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-    requests.post(url, json={"chat_id": chat_id, "text": text})
+    try:
+        requests.post(url, json={"chat_id": chat_id, "text": text}, timeout=10)
+    except:
+        pass
 
 def upload_to_rubika(file_path, caption):
     """فرآیند ۳ مرحله‌ای آپلود فایل در روبیکا"""
@@ -25,33 +31,37 @@ def upload_to_rubika(file_path, caption):
     elif ext in ['mp3', 'wav', 'm4a']: file_type = "Audio"
     elif ext in ['ogg']: file_type = "Voice"
 
-    # مرحله ۱: درخواست آدرس آپلود
-    req_url = f"https://botapi.rubika.ir/v3/{RUBIKA_TOKEN}/requestSendFile"
-    res1 = requests.post(req_url, json={"type": file_type}, headers={"Content-Type": "application/json"}).json()
-    if "data" not in res1 or "upload_url" not in res1["data"]:
-        return False
-    upload_url = res1["data"]["upload_url"]
-
-    # مرحله ۲: آپلود فایل
     try:
+        # مرحله ۱: درخواست آدرس آپلود
+        req_url = f"https://botapi.rubika.ir/v3/{RUBIKA_TOKEN}/requestSendFile"
+        res1 = requests.post(req_url, json={"type": file_type}, headers={"Content-Type": "application/json"}, timeout=30).json()
+        if "data" not in res1 or "upload_url" not in res1["data"]:
+            print(f"❌ خطا در مرحله ۱ روبیکا: {res1}")
+            return False
+        upload_url = res1["data"]["upload_url"]
+
+        # مرحله ۲: آپلود فایل
         with open(file_path, 'rb') as f:
             files = {'file': (os.path.basename(file_path), f)}
             res2 = requests.post(upload_url, files=files, timeout=300).json()
             if "data" not in res2 or "file_id" not in res2["data"]:
+                print(f"❌ خطا در مرحله ۲ روبیکا: {res2}")
                 return False
         new_file_id = res2["data"]["file_id"]
-    except Exception:
-        return False
 
-    # مرحله ۳: ارسال به چت
-    send_url = f"https://botapi.rubika.ir/v3/{RUBIKA_TOKEN}/sendFile"
-    res3 = requests.post(send_url, json={
-        "chat_id": TARGET_CHAT_ID,
-        "file_id": new_file_id,
-        "text": caption
-    }, headers={"Content-Type": "application/json"}).json()
-    
-    return res3.get("status") == "OK"
+        # مرحله ۳: ارسال به چت
+        send_url = f"https://botapi.rubika.ir/v3/{RUBIKA_TOKEN}/sendFile"
+        res3 = requests.post(send_url, json={
+            "chat_id": TARGET_CHAT_ID,
+            "file_id": new_file_id,
+            "text": caption
+        }, headers={"Content-Type": "application/json"}, timeout=30).json()
+        
+        print(f"✅ آپلود در روبیکا موفق بود: {res3}")
+        return res3.get("status") == "OK"
+    except Exception as e:
+        print(f"❌ خطا در آپلود روبیکا: {str(e)}")
+        return False
 
 @app.route('/', methods=['POST'])
 def webhook():
@@ -59,10 +69,24 @@ def webhook():
     if not data or 'message' not in data:
         return jsonify({"ok": True})
 
+    # ⭐ جلوگیری از پردازش تکراری
+    update_id = data.get('update_id')
+    if update_id in processed_updates:
+        print(f"⚠️ Update {update_id} قبلاً پردازش شده. نادیده گرفته شد.")
+        return jsonify({"ok": True})
+    
+    processed_updates.add(update_id)
+    
+    # محدود کردن اندازه لیست (برای جلوگیری از پر شدن حافظه)
+    if len(processed_updates) > 1000:
+        processed_updates.clear()
+
     msg = data['message']
     chat_id = msg['chat']['id']
     text = msg.get('text', '').strip()
     temp_dir = "/tmp"
+
+    print(f"📩 پیام جدید از {chat_id}: {text[:50]}...")
 
     # ================= ۱. بررسی لینک یوتیوب =================
     if 'youtube.com' in text or 'youtu.be' in text:
@@ -70,9 +94,10 @@ def webhook():
         filename = os.path.join(temp_dir, f"yt_{uuid.uuid4().hex}.mp4")
         
         ydl_opts = {
-            'format': 'best[height<=720]', # دانلود با کیفیت حداکثر 720p برای سرعت و پایداری بیشتر
+            'format': 'best[height<=720]',
             'outtmpl': filename,
             'noplaylist': True,
+            'quiet': True,
         }
         
         try:
@@ -80,12 +105,12 @@ def webhook():
                 ydl.download([text])
             
             send_tg_message(chat_id, "⬆️ دانلود انجام شد. در حال ارسال به روبیکا...")
-            if upload_to_rubika(filename, f"📥 دانلود از یوتیوب:\n{text}"):
+            if upload_to_rubika(filename, "📥 دانلود از یوتیوب"):
                 send_tg_message(chat_id, "✅ ویدیو یوتیوب با موفقیت ارسال شد!")
             else:
                 send_tg_message(chat_id, "❌ خطا در آپلود در روبیکا.")
         except Exception as e:
-            send_tg_message(chat_id, f"❌ خطا در دانلود یوتیوب. (لینک را چک کنید)\n{str(e)}")
+            send_tg_message(chat_id, f"❌ خطا در دانلود یوتیوب.\n{str(e)[:100]}")
         finally:
             if os.path.exists(filename):
                 os.remove(filename)
@@ -95,12 +120,10 @@ def webhook():
     if text.startswith('http://') or text.startswith('https://'):
         send_tg_message(chat_id, "⏳ در حال دانلود از لینک...")
         
-        # تلاش برای پیدا کردن نام فایل از هدرها یا URL
         filename = os.path.join(temp_dir, f"dl_{uuid.uuid4().hex}")
         try:
             with requests.get(text, stream=True, timeout=300) as r:
                 r.raise_for_status()
-                # اگر سرور نام فایل را فرستاد، از آن استفاده کن
                 if 'content-disposition' in r.headers:
                     cd = r.headers['content-disposition']
                     if 'filename=' in cd:
@@ -111,13 +134,16 @@ def webhook():
                     for chunk in r.iter_content(chunk_size=8192):
                         f.write(chunk)
             
+            file_size = os.path.getsize(filename)
+            print(f"✅ دانلود موفق. حجم: {file_size} بایت")
+            
             send_tg_message(chat_id, "⬆️ دانلود انجام شد. در حال ارسال به روبیکا...")
-            if upload_to_rubika(filename, "📤 انتقال از لینک مستقیم/عمومی"):
+            if upload_to_rubika(filename, "📤 انتقال از لینک"):
                 send_tg_message(chat_id, "✅ فایل با موفقیت ارسال شد!")
             else:
                 send_tg_message(chat_id, "❌ خطا در آپلود در روبیکا.")
         except Exception as e:
-            send_tg_message(chat_id, f"❌ خطا در دانلود لینک. مطمئن شوید لینک مستقیم و عمومی است.\n{str(e)}")
+            send_tg_message(chat_id, f"❌ خطا در دانلود لینک.\n{str(e)[:100]}")
         finally:
             if os.path.exists(filename):
                 os.remove(filename)
@@ -150,12 +176,12 @@ def webhook():
             send_tg_message(chat_id, 
                 f"⚠️ این فایل {round(file_size/1024/1024, 1)} مگابایت است.\n\n"
                 "🤖 API رسمی تلگرام به ربات‌ها اجازه دانلود فایل‌های بالای ۲۰ مگابایت را نمی‌دهد.\n\n"
-                "💡 راه‌حل: لینک مستقیم دانلود این فایل را برای من بفرستید تا آن را انتقال دهم.")
+                "💡 راه‌حل: لینک مستقیم دانلود این فایل را برای من بفرستید.")
             return jsonify({"ok": True})
 
         send_tg_message(chat_id, "⏳ در حال دریافت فایل و انتقال به روبیکا...")
         
-        file_req = requests.get(f"https://api.telegram.org/bot{TG_TOKEN}/getFile?file_id={file_info['file_id']}").json()
+        file_req = requests.get(f"https://api.telegram.org/bot{TG_TOKEN}/getFile?file_id={file_info['file_id']}", timeout=30).json()
         if not file_req.get('ok'):
             send_tg_message(chat_id, "❌ خطا در دریافت اطلاعات فایل از تلگرام.")
             return jsonify({"ok": True})
@@ -164,7 +190,7 @@ def webhook():
         temp_file = os.path.join(temp_dir, file_name)
         
         try:
-            with requests.get(download_url, stream=True) as r:
+            with requests.get(download_url, stream=True, timeout=120) as r:
                 r.raise_for_status()
                 with open(temp_file, 'wb') as f:
                     for chunk in r.iter_content(chunk_size=8192):
@@ -176,7 +202,7 @@ def webhook():
             else:
                 send_tg_message(chat_id, "❌ خطا در آپلود فایل در سرور روبیکا.")
         except Exception as e:
-            send_tg_message(chat_id, f"❌ خطا در پردازش فایل: {str(e)}")
+            send_tg_message(chat_id, f"❌ خطا در پردازش فایل: {str(e)[:100]}")
         finally:
             if os.path.exists(temp_file):
                 os.remove(temp_file)
