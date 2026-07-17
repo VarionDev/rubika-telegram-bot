@@ -9,8 +9,8 @@ app = Flask(__name__)
 TG_TOKEN = '8067819715:AAGDbuuq1Tyo7Ar8RiUsBfrRm4lyr0UnbZc'
 
 # ⚠️ اطلاعات آپارات خود را اینجا وارد کنید
-APARAT_USERNAME = os.environ.get('APARAT_USERNAME', 'your_aparat_username')
-APARAT_PASSWORD = os.environ.get('APARAT_PASSWORD', 'your_aparat_password')
+APARAT_USERNAME = os.environ.get('APARAT_USERNAME', 'mataleb_darsi')
+APARAT_PASSWORD = os.environ.get('APARAT_PASSWORD', 'abolfazl')
 # ============================================
 
 def send_tg_message(chat_id, text):
