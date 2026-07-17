@@ -1,6 +1,8 @@
 import os
 import requests
 import uuid
+import hashlib
+import json
 from requests_toolbelt import MultipartEncoder, MultipartEncoderMonitor
 from flask import Flask, request, jsonify
 
@@ -18,100 +20,115 @@ def send_tg_message(chat_id, text):
     try:
         requests.post(url, json={"chat_id": chat_id, "text": text}, timeout=10)
     except Exception as e:
-        print(f"خطا در ارسال پیام: {e}")
+        print(f"خطا در ارسال پیام تلگرام: {e}")
 
-def create_streaming_encoder(file_path, fields):
-    """ساخت encoder برای آپلود تکه‌تکه (بدون پر کردن رم)"""
-    # باز کردن فایل
-    file_handle = open(file_path, 'rb')
+def get_aparat_ltoken(username, password):
+    """مرحله ۱: لاگین و دریافت ltoken طبق مستندات آپارات"""
+    # رمز عبور باید به صورت sha1(MD5(password)) هش شود
+    md5_hash = hashlib.md5(password.encode('utf-8')).digest()
+    sha1_hash = hashlib.sha1(md5_hash).hexdigest()
     
-    # ساخت فیلدهای multipart
-    multipart_fields = list(fields.items())
-    multipart_fields.append(
-        ('video', (os.path.basename(file_path), file_handle, 'video/mp4'))
-    )
+    login_url = f"https://www.aparat.com/etc/api/login/luser/{username}/lpass/{sha1_hash}"
+    print(f"🔐 تلاش برای لاگین در آپارات...")
     
-    encoder = MultipartEncoder(fields=multipart_fields)
+    try:
+        res = requests.get(login_url, timeout=30)
+        print(f"📥 پاسخ خام لاگین: {res.text[:300]}")
+        data = res.json()
+        
+        # استخراج ltoken از پاسخ (طبق مستندات، در آرایه login یا root قرار دارد)
+        if 'login' in data and 'ltoken' in data['login']:
+            return data['login']['ltoken']
+        elif 'ltoken' in data:
+            return data['ltoken']
+        else:
+            return None, f"خطا در دریافت توکن: {data}"
+    except Exception as e:
+        return None, str(e)
+
+def get_upload_form(username, ltoken):
+    """مرحله ۲: دریافت formAction و frm-id"""
+    form_url = f"https://www.aparat.com/etc/api/uploadform/luser/{username}/ltoken/{ltoken}"
+    print(f"📝 درخواست فرم آپلود...")
     
-    # مانیتور برای نمایش پیشرفت (اختیاری)
-    def callback(monitor):
-        if monitor.bytes_read % (10 * 1024 * 1024) < 8192:  # هر ۱۰ مگابایت
-            percent = (monitor.bytes_read / monitor.len) * 100
-            print(f"📤 آپلود: {percent:.1f}% ({monitor.bytes_read / 1024 / 1024:.1f} MB)")
-    
-    monitor = MultipartEncoderMonitor(encoder, callback)
-    return monitor, file_handle
+    try:
+        res = requests.get(form_url, timeout=30)
+        print(f"📥 پاسخ خام فرم: {res.text[:300]}")
+        data = res.json()
+        
+        if 'uploadform' in data:
+            return data['uploadform']['formAction'], data['uploadform']['frm-id']
+        else:
+            return None, None, f"خطا در دریافت فرم: {data}"
+    except Exception as e:
+        return None, None, str(e)
 
 def upload_to_aparat(video_path, title, description="آپلود خودکار توسط ربات"):
-    """آپلود ویدیو در آپارات با Streaming Upload"""
+    """مرحله ۳: آپلود تکه‌تکه فایل به آپارات"""
     file_handle = None
     try:
-        print(f"📤 شروع آپلود در آپارات: {title}")
+        print(f"📤 شروع فرآیند آپلود در آپارات: {title}")
         
-        # مرحله ۱: احراز هویت
-        auth_url = "https://www.aparat.com/api/fa/v1/user/authenticate"
-        auth_data = {
-            "accountname": APARAT_USERNAME,
-            "password": APARAT_PASSWORD
-        }
-        
-        print(f"🔐 تلاش برای احراز هویت...")
-        auth_res = requests.post(auth_url, data=auth_data, timeout=30)
-        
-        try:
-            auth_json = auth_res.json()
-        except:
-            return None, f"پاسخ نامعتبر از آپارات: {auth_res.text[:200]}"
-        
-        if "data" not in auth_json or "ltoken" not in auth_json["data"]:
-            return None, f"خطا در احراز هویت: {auth_json.get('errors', 'نامشخص')}"
-        
-        ltoken = auth_json["data"]["ltoken"]
-        print(f"✅ احراز هویت موفق")
+        # ۱. دریافت توکن
+        ltoken_result = get_aparat_ltoken(APARAT_USERNAME, APARAT_PASSWORD)
+        if isinstance(ltoken_result, tuple): # یعنی خطا رخ داده
+            return None, ltoken_result[1]
+        ltoken = ltoken_result
+        print(f"✅ توکن دریافت شد: {ltoken[:10]}...")
 
-        # مرحله ۲: آپلود فایل به صورت Streaming (تکه‌تکه)
-        upload_url = "https://www.aparat.com/api/fa/v1/video/upload/uploadfile"
+        # ۲. دریافت آدرس آپلود
+        form_action, frm_id = get_upload_form(APARAT_USERNAME, ltoken)
+        if not form_action:
+            return None, frm_id # frm_id در اینجا حاوی پیام خطا است
+        print(f"✅ آدرس آپلود دریافت شد. frm-id: {frm_id}")
+
+        # ۳. آپلود فایل به صورت Streaming (تکه‌تکه برای جلوگیری از پر شدن رم)
+        print(f"⬆️ شروع آپلود تکه‌تکه فایل...")
+        file_handle = open(video_path, 'rb')
         
+        # فیلدها دقیقاً طبق مستندات آپارات
         fields = {
-            'ltoken': ltoken,
-            'title': title,
-            'description': description,
-            'category': '11'
+            'video': (os.path.basename(video_path), file_handle, 'video/mp4'),
+            'frm-id': str(frm_id),
+            'data[title]': title,
+            'data[category]': '11',  # ۱۱ = آموزشی
+            'data[comment]': 'yes',
+            'data[descr]': description,
+            'data[video_pass]': 'false'
         }
         
-        print(f"⬆️ شروع آپلود تکه‌تکه (Streaming)...")
-        monitor, file_handle = create_streaming_encoder(video_path, fields)
+        encoder = MultipartEncoder(fields=fields)
         
-        upload_res = requests.post(
-            upload_url, 
-            data=monitor, 
-            headers={'Content-Type': monitor.content_type},
-            timeout=1800  # ۳۰ دقیقه زمان برای آپلود
-        )
+        def callback(monitor):
+            if monitor.bytes_read % (10 * 1024 * 1024) < 8192:  # هر ۱۰ مگابایت
+                percent = (monitor.bytes_read / monitor.len) * 100
+                print(f"📤 پیشرفت آپلود: {percent:.1f}% ({monitor.bytes_read / 1024 / 1024:.1f} MB)")
         
-        print(f"📥 پاسخ آپلود: {upload_res.text[:300]}")
+        monitor = MultipartEncoderMonitor(encoder, callback)
+        
+        headers = {'Content-Type': monitor.content_type}
+        upload_res = requests.post(form_action, data=monitor, headers=headers, timeout=1800)
+        
+        print(f"📥 پاسخ خام آپلود: {upload_res.text[:500]}")
         
         try:
-            upload_json = upload_res.json()
-        except:
-            return None, f"پاسخ نامعتبر: {upload_res.text[:200]}"
-        
-        if "data" not in upload_json:
-            return None, f"خطا در آپلود: {upload_json.get('errors', upload_json)}"
-        
-        video_uid = upload_json["data"]["uid"]
-        print(f"✅ ویدیو آپلود شد. UID: {video_uid}")
-        
-        aparat_link = f"https://www.aparat.com/v/{video_uid}"
-        return aparat_link, None
-        
+            data = upload_res.json()
+            # طبق مستندات، در صورت موفقیت uid برگردانده می‌شود
+            if 'uid' in data:
+                video_uid = data['uid']
+                print(f"✅ ویدیو با موفقیت آپلود شد. UID: {video_uid}")
+                return f"https://www.aparat.com/v/{video_uid}", None
+            else:
+                return None, f"پاسخ نامعتبر از سرور آپارات: {data}"
+        except json.JSONDecodeError:
+            return None, f"پاسخ JSON نامعتبر از آپارات: {upload_res.text[:200]}"
+            
     except Exception as e:
-        print(f"❌ خطای استثناء: {str(e)}")
+        print(f"❌ خطای استثناء در آپلود: {str(e)}")
         import traceback
         traceback.print_exc()
         return None, str(e)
     finally:
-        # بستن فایل در هر حالت
         if file_handle:
             file_handle.close()
 
@@ -126,13 +143,11 @@ def webhook():
     text = msg.get('text', '').strip()
 
     if text.startswith('http://') or text.startswith('https://'):
-        send_tg_message(chat_id, "⏳ در حال دانلود و آپلود...\n(ممکن است ۱۰-۲۰ دقیقه طول بکشد)")
+        send_tg_message(chat_id, "⏳ لینک دریافت شد. در حال دانلود و آپلود در آپارات...\n(این فرآیند ممکن است ۱۰-۲۰ دقیقه طول بکشد)")
         
         filename = f"/tmp/video_{uuid.uuid4().hex}.mp4"
         try:
-            print(f"⬇️ شروع دانلود از: {text[:50]}...")
-            
-            # دانلود به صورت Streaming (تکه‌تکه)
+            print(f"⬇️ شروع دانلود از لینک...")
             with requests.get(text, stream=True, timeout=1800) as r:
                 r.raise_for_status()
                 total_size = int(r.headers.get('content-length', 0))
@@ -145,23 +160,23 @@ def webhook():
                             downloaded += len(chunk)
                             if total_size > 0 and downloaded % (10 * 1024 * 1024) < 8192:
                                 percent = (downloaded / total_size) * 100
-                                print(f"📥 دانلود: {percent:.1f}%")
+                                print(f"📥 پیشرفت دانلود: {percent:.1f}%")
             
             file_size = os.path.getsize(filename)
             print(f"✅ دانلود موفق. حجم: {file_size / 1024 / 1024:.1f} MB")
             
-            send_tg_message(chat_id, f"⬆️ دانلود شد ({file_size / 1024 / 1024:.1f} MB). در حال آپلود...")
+            send_tg_message(chat_id, f"⬆️ دانلود انجام شد ({file_size / 1024 / 1024:.1f} MB). در حال آپلود در آپارات...")
             
-            title = f"ویدیو - {uuid.uuid4().hex[:8]}"
+            title = f"ویدیو آموزشی - {uuid.uuid4().hex[:8]}"
             aparat_link, error = upload_to_aparat(filename, title)
             
             if aparat_link:
-                send_tg_message(chat_id, f"✅ آپلود موفق!\n\n🔗 {aparat_link}")
+                send_tg_message(chat_id, f"✅ آپلود با موفقیت انجام شد!\n\n🔗 لینک استریم (نیم‌بها):\n{aparat_link}")
             else:
-                send_tg_message(chat_id, f"❌ خطا:\n{error}")
+                send_tg_message(chat_id, f"❌ خطا در آپلود:\n{error}")
                 
         except Exception as e:
-            send_tg_message(chat_id, f"❌ خطا: {str(e)[:200]}")
+            send_tg_message(chat_id, f"❌ خطا در پردازش: {str(e)[:200]}")
         finally:
             if os.path.exists(filename):
                 os.remove(filename)
